@@ -1,0 +1,284 @@
+{
+  "name": "DocFlow AI — Invoice Processing Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "invoice-upload",
+        "httpMethod": "POST",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook: Receive Document",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "notes": "Entry point — receives file uploads from external systems or manual triggers"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate incoming webhook payload\nconst body = $input.first().json.body || $input.first().json;\n\nif (!body.file_url && !body.file_base64) {\n  throw new Error('Missing file_url or file_base64 in payload');\n}\n\nreturn [{\n  json: {\n    file_url: body.file_url || null,\n    file_base64: body.file_base64 || null,\n    filename: body.filename || 'document.pdf',\n    source: body.source || 'webhook',\n    received_at: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "validate-input",
+      "name": "Validate Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://api:8000/documents/upload",
+        "method": "POST",
+        "sendBody": true,
+        "contentType": "multipart-form-data",
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "value": "={{ $json.file_base64 }}",
+              "parameterType": "formBinaryData"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "process-document",
+      "name": "DocFlow API: Process Document",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [640, 300],
+      "notes": "Calls DocFlow AI pipeline: OCR → LLM → semantic match → confidence score"
+    },
+    {
+      "parameters": {
+        "jsCode": "const result = $input.first().json;\n\n// Route based on confidence and review status\nconst confidence = result.overall_confidence || 0;\nconst status = result.review_status;\n\nreturn [{\n  json: {\n    ...result,\n    routing: {\n      needs_review: status === 'needs_review',\n      auto_approved: status === 'approved',\n      has_error: result.status === 'error',\n      confidence_pct: Math.round(confidence * 100)\n    }\n  }\n}];"
+      },
+      "id": "route-result",
+      "name": "Route by Confidence",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.routing.needs_review }}",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "check-review-needed",
+      "name": "Needs Human Review?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1040, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://api:8000/documents/{{ $json.job_id }}/download/csv",
+        "method": "GET",
+        "options": {}
+      },
+      "id": "download-csv",
+      "name": "Download CSV Export",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1240, 160],
+      "notes": "Auto-approved path — download the structured CSV"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Slack notification for HIGH CONFIDENCE auto-approved invoices\nconst r = $input.first().json;\nconst inv = r.invoice_data || {};\n\nconst lineItemsText = (inv.line_items || []).slice(0, 3)\n  .map(item => `  • ${item.description}: ${item.total || 'N/A'}`)\n  .join('\\n');\n\nreturn [{\n  json: {\n    blocks: [\n      {\n        type: 'header',\n        text: { type: 'plain_text', text: '✅ Invoice Auto-Processed' }\n      },\n      {\n        type: 'section',\n        fields: [\n          { type: 'mrkdwn', text: `*Vendor:*\\n${inv.vendor_name || 'Unknown'}` },\n          { type: 'mrkdwn', text: `*Invoice #:*\\n${inv.invoice_number || 'N/A'}` },\n          { type: 'mrkdwn', text: `*Total:*\\n${inv.currency} ${inv.total_amount || 'N/A'}` },\n          { type: 'mrkdwn', text: `*Confidence:*\\n${r.routing.confidence_pct}%` }\n        ]\n      },\n      {\n        type: 'section',\n        text: { type: 'mrkdwn', text: `*Top Line Items:*\\n${lineItemsText || 'None'}` }\n      }\n    ]\n  }\n}];"
+      },
+      "id": "build-approved-notification",
+      "name": "Build Approval Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 160]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Slack alert for LOW CONFIDENCE — needs human review\nconst r = $input.first().json;\nconst inv = r.invoice_data || {};\n\nconst reviewUrl = `http://localhost:8000/docs#/Human%20Review/approve_review__job_id__approve_patch`;\n\nreturn [{\n  json: {\n    blocks: [\n      {\n        type: 'header',\n        text: { type: 'plain_text', text: '⚠️ Invoice Needs Review' }\n      },\n      {\n        type: 'section',\n        fields: [\n          { type: 'mrkdwn', text: `*Job ID:*\\n${r.job_id}` },\n          { type: 'mrkdwn', text: `*File:*\\n${r.filename}` },\n          { type: 'mrkdwn', text: `*Confidence:*\\n${r.routing.confidence_pct}%` },\n          { type: 'mrkdwn', text: `*Vendor:*\\n${inv.vendor_name || 'Could not extract'}` }\n        ]\n      },\n      {\n        type: 'section',\n        text: { type: 'mrkdwn', text: `*Issues:*\\n${r.review_notes || 'Low confidence extraction'}` }\n      },\n      {\n        type: 'actions',\n        elements: [\n          {\n            type: 'button',\n            text: { type: 'plain_text', text: 'Review Now' },\n            url: `http://localhost:8000/docs`,\n            style: 'primary'\n          }\n        ]\n      }\n    ]\n  }\n}];"
+      },
+      "id": "build-review-alert",
+      "name": "Build Review Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1240, 440]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "blocks",
+              "value": "={{ $json.blocks }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "notify-slack-approved",
+      "name": "Slack: Auto-Approved Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1640, 160],
+      "notes": "Replace YOUR_SLACK_WEBHOOK_URL with your Slack incoming webhook"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "blocks",
+              "value": "={{ $json.blocks }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "notify-slack-review",
+      "name": "Slack: Review Required Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1440, 440]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "schedule-poll",
+      "name": "Schedule: Poll Review Queue",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 600],
+      "notes": "Every 5 min — check for stuck items in review queue"
+    },
+    {
+      "parameters": {
+        "url": "http://api:8000/review/stats",
+        "method": "GET",
+        "options": {}
+      },
+      "id": "check-review-queue",
+      "name": "Get Review Queue Stats",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [440, 600]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.pending_review }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      },
+      "id": "check-pending",
+      "name": "Any Pending Reviews?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [640, 600]
+    },
+    {
+      "parameters": {
+        "jsCode": "const stats = $input.first().json;\nreturn [{\n  json: {\n    text: `📋 *DocFlow Review Queue*: ${stats.pending_review} invoices awaiting review | Avg confidence: ${Math.round(stats.avg_confidence * 100)}% | Total processed: ${stats.total_documents}`\n  }\n}];"
+      },
+      "id": "format-queue-alert",
+      "name": "Format Queue Summary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [840, 500]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "text",
+              "value": "={{ $json.text }}"
+            }
+          ]
+        }
+      },
+      "id": "notify-queue-summary",
+      "name": "Slack: Queue Summary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [1040, 500]
+    }
+  ],
+  "connections": {
+    "Webhook: Receive Document": {
+      "main": [[{ "node": "Validate Input", "type": "main", "index": 0 }]]
+    },
+    "Validate Input": {
+      "main": [[{ "node": "DocFlow API: Process Document", "type": "main", "index": 0 }]]
+    },
+    "DocFlow API: Process Document": {
+      "main": [[{ "node": "Route by Confidence", "type": "main", "index": 0 }]]
+    },
+    "Route by Confidence": {
+      "main": [[{ "node": "Needs Human Review?", "type": "main", "index": 0 }]]
+    },
+    "Needs Human Review?": {
+      "main": [
+        [{ "node": "Build Review Alert", "type": "main", "index": 0 }],
+        [{ "node": "Download CSV Export", "type": "main", "index": 0 }]
+      ]
+    },
+    "Download CSV Export": {
+      "main": [[{ "node": "Build Approval Notification", "type": "main", "index": 0 }]]
+    },
+    "Build Approval Notification": {
+      "main": [[{ "node": "Slack: Auto-Approved Alert", "type": "main", "index": 0 }]]
+    },
+    "Build Review Alert": {
+      "main": [[{ "node": "Slack: Review Required Alert", "type": "main", "index": 0 }]]
+    },
+    "Schedule: Poll Review Queue": {
+      "main": [[{ "node": "Get Review Queue Stats", "type": "main", "index": 0 }]]
+    },
+    "Get Review Queue Stats": {
+      "main": [[{ "node": "Any Pending Reviews?", "type": "main", "index": 0 }]]
+    },
+    "Any Pending Reviews?": {
+      "main": [
+        [{ "node": "Format Queue Summary", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Format Queue Summary": {
+      "main": [[{ "node": "Slack: Queue Summary", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": ["docflow", "invoices", "ai", "local"]
+}
